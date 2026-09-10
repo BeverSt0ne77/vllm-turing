@@ -1,90 +1,103 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vllm-turing
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+> 面向 **2 × RTX 2080 Ti 22G + NVLink** 定向优化的 vLLM 个人分支
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+本仓库 fork 自 [vllm-project/vllm](https://github.com/vllm-project/vllm) **v0.29.0**。目标是让 vLLM 在自己的机器上跑得尽可能快、尽可能稳；除硬件适配外尽量与上游保持一致，方便后续跟随上游 rebase。
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+## 目标硬件
 
----
+| 项目 | 值 |
+| --- | --- |
+| GPU | 2 × RTX 2080 Ti 22G（改装显存版） |
+| 架构 | NVIDIA Turing，compute capability **SM 7.5** |
+| 互联 | NVLink（2-way），双卡可跑张量并行 `TP=2` |
 
-## About
+## 硬件限制与应对
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+Turing 架构缺少 Ampere 及以后的部分特性，使用时有几个硬性约束：
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+| 特性 | 上游要求 | 本机情况 | 应对 |
+| --- | --- | --- | --- |
+| bfloat16 | SM ≥ 8.0 | 不支持 | 改用 float16：`--dtype=half` |
+| FP8 | SM ≥ 8.9 | 不支持 | 改用 INT8/INT4 量化；注意部分量化 kernel 同样要求 SM80+ |
+| FlashAttention | SM ≥ 8.0 | 不可用 | 使用 Triton 注意力后端：`--attention-backend TRITON_ATTN` |
+| FlashInfer | SM ≥ 8.0（SM75 暂被禁用） | 不可用 | 同上，走 Triton |
+| NVLink | — | 可用 | `--tensor-parallel-size 2` |
 
-vLLM is fast with:
+> vLLM 启动时会按设备能力自动筛选可用后端，在 2080 Ti 上会落到 Triton 等可用后端。显式指定 `TRITON_ATTN` 可避免反复探测与误选。
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+## 环境要求
 
-vLLM is flexible and easy to use with:
+- Python 3.10 – 3.14（推荐 3.12）
+- CUDA 12.x（由 PyTorch 提供）
+- PyTorch 2.13.0
+- **从源码编译**：上游预编译 wheel 不含 SM 7.5 的完整 kernel，不能直接用于 Turing
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+## 从源码安装
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+遵循上游约定，Python 命令统一走 `uv`，不要用系统 `python3` / 裸 `pip`：
 
 ```bash
-uv pip install vllm
+# 安装 uv（已装可跳过）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv --python 3.12
+source .venv/bin/activate
+
+# 本地编译安装（MAX_JOBS 按 CPU 核心数与内存调整，过高易 OOM）
+MAX_JOBS=$(nproc) uv pip install -e . --no-build-isolation
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+> 提示：不要设置 `VLLM_USE_PRECOMPILED=1`，它使用上游预编译产物，在 Turing 上可能缺少对应架构的 kernel。
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+## 双卡运行示例
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+启动 OpenAI 兼容 API 服务：
 
-## Contributing
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --tensor-parallel-size 2 \
+  --dtype half \
+  --attention-backend TRITON_ATTN \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.92
+```
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+离线批量推理：
 
-## Citation
+```python
+from vllm import LLM, SamplingParams
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+llm = LLM(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    tensor_parallel_size=2,
+    dtype="half",
+    attention_backend="TRITON_ATTN",
+)
+
+outputs = llm.generate(
+    ["你好，请简单介绍一下你自己。"],
+    SamplingParams(max_tokens=128),
+)
+print(outputs[0].outputs[0].text)
+```
+
+> 单卡 22G 显存有限，7B 模型 FP16 权重约需 15G；双卡 `TP=2` 可留出充足的 KV cache 空间。更大的模型可叠加量化使用。
+
+## 与上游的差异
+
+- 已移除整个 `.github/`（工作流、issue 模板、CODEOWNERS、mergify、dependabot 等）与 `.buildkite/` 流水线，本分支不使用上游 CI。
+- 后续会加入针对 SM 7.5 与 NVLink 的定向优化，详见提交记录。
+
+## 上游资源
+
+- 文档：<https://docs.vllm.ai>
+- 论文（PagedAttention）：<https://arxiv.org/abs/2309.06180>
+- 上游仓库：<https://github.com/vllm-project/vllm>
+
+## 引用
+
+如果本分支对你的研究有帮助，请引用 vLLM 原始论文：
 
 ```bibtex
 @inproceedings{kwon2023efficient,
@@ -94,17 +107,3 @@ If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs
   year={2023}
 }
 ```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)

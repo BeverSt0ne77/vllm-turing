@@ -5,8 +5,7 @@
 covered by `requires-python`. Fails closed if a Python's `.so` is missing
 from the wheel — i.e. the regression that surfaced in #41476/#41512.
 
-Run from a CI test job after vLLM is installed, e.g. the H100 deepgemm
-kernel tests in .buildkite/test_areas/kernels.yaml.
+Run after vLLM is installed, e.g. as part of a local wheel/kernel check.
 """
 
 import importlib.util
