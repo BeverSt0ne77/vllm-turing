@@ -504,12 +504,11 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer supports SM75+, but is currently broken on SM75 (Turing):
-        # https://github.com/flashinfer-ai/flashinfer/issues/3620 (fix:
-        # https://github.com/flashinfer-ai/flashinfer/pull/3621). Temporarily
-        # raise the floor to SM80 so it is not auto-selected on SM75 until
-        # that fix lands; revert to DeviceCapability(7, 5) once it does.
-        return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
+        # [turing-sm75] FlashInfer supports SM75+; the temporary SM80 floor below
+        # was only because SM75 was broken before flashinfer#3621. We pin
+        # flashinfer-python==0.6.18 which contains that fix, so allow SM75 (7,5).
+        # Upstream: https://github.com/flashinfer-ai/flashinfer/issues/3620
+        return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
 
