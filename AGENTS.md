@@ -1,158 +1,94 @@
-# Agent Instructions for vLLM
+# Agent Instructions for vllm-turing
 
-> These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
-> Breaching these guidelines can result in automatic banning.
+> 本仓库是 `vllm-project/vllm` v0.29.0 的个人分支，用于 **2 × RTX 2080 Ti 22G + NVLink** 的定向优化。
+> 不使用上游 CI（`.github/`、`.buildkite/` 已移除），也不走上游 PR/合并流程。除非明确要求，不要新增 workflow 或 CI 配置。
 
-## 1. Contribution Policy (Mandatory)
+## 1. 硬件约束（改动前必读）
 
-### Duplicate-work checks
+目标 GPU 是 Turing 架构，compute capability **SM 7.5**，缺少 Ampere 及以后的部分特性：
 
-Before proposing a PR, run these checks:
+- **不要引入 bf16 依赖**：SM 7.5 不支持，需用 float16（`--dtype=half`）。
+- **不要引入 FP8 依赖**：需 SM ≥ 8.9，本机不支持。
+- **不要默认 FlashAttention / FlashInfer**：均需 SM ≥ 8.0；注意力走 **Triton 后端**（`TRITON_ATTN`）。
+- 双卡通过 NVLink 互联，分布式推理默认走 **TP=2**。
+- 本机必须**从源码编译**：不要用 `VLLM_USE_PRECOMPILED=1`，预编译产物缺少 SM 7.5 的 kernel。
 
-```bash
-gh issue view <issue_number> --repo vllm-project/vllm --comments
-gh pr list --repo vllm-project/vllm --state open --search "<issue_number> in:body"
-gh pr list --repo vllm-project/vllm --state open --search "<short area keywords>"
-```
+修改涉及架构判断的代码时，确认新路径在 SM 7.5 上不会因能力门控而不可用。
 
-- If an open PR already addresses the same fix, do not open another.
-- If your approach is materially different, explain the difference in the issue.
+## 2. 开发环境
 
-### No low-value busywork PRs
-
-Do not open one-off PRs for tiny edits (single typo, isolated style change, one mutable default, etc.). Mechanical cleanups are acceptable only when bundled with substantive work.
-
-### Accountability
-
-- Pure code-agent PRs are **not allowed**. A human submitter must understand and defend the change end-to-end.
-- The submitting human must review every changed line and run relevant tests.
-- PR descriptions for AI-assisted work **must** include:
-    - Why this is not duplicating an existing PR.
-    - Test commands run and results.
-    - Model evaluation results when the change affects output, accuracy, or serving.
-    - Clear statement that AI assistance was used.
-
-### Fail-closed behavior
-
-If work is duplicate/trivial busywork, **do not proceed**. Return a short explanation of what is missing.
-
----
-
-## 2. Development Workflow
-
-- **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
-
-### Environment setup
+- **不要用系统 `python3` 或裸 `pip`**。统一走 `uv` 和 `.venv/bin/python`。
 
 ```bash
-# Install `uv` if you don't have it already:
+# 安装 uv（已装可跳过）
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Always use `uv` for Python environment management:
 uv venv --python 3.12
 source .venv/bin/activate
 
-# Always make sure `pre-commit` and its hooks are installed:
+# 源码编译安装（按机器调整 MAX_JOBS，过高易 OOM）
+MAX_JOBS=$(nproc) uv pip install -e . --no-build-isolation
+
+# 安装 pre-commit 钩子
 uv pip install -r requirements/lint.txt
 pre-commit install
 ```
 
-### Installing dependencies
+C/C++ 或 CUDA 改动请参考
+[增量编译流程](docs/contributing/incremental_build.md)。
+
+## 3. 测试
 
 ```bash
-# Start with precompiled artifacts for an editable install:
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-```
-
-For C/C++ or CUDA changes, follow the
-[incremental compilation workflow](docs/contributing/incremental_build.md) to
-configure and perform incremental builds.
-
-### Tests
-
-> Requires [Environment setup](#environment-setup) and [Installing dependencies](#installing-dependencies).
-
-```bash
-# Install test dependencies (use cuda.in on non-x86_64):
+# 安装测试依赖
 uv pip install -r requirements/test/cuda.in
 
-# Run a specific test file:
+# 运行单个测试文件
 .venv/bin/python -m pytest tests/path/to/test_file.py -v
 ```
 
-When adding tests:
+- 先设计再写：明确模块用途、I/O 契约、要防的失败，以及最低成本能覆盖它的层级（unit > integration > e2e）。
+- 优先复用已有的测试文件、`conftest.py` fixture 与 helper，没有合适位置才新建文件。
+- 通过公开 API 断言可观察行为；不稳定（flaky）的测试比没有测试更糟。
+- kernel 性能实验放 `benchmarks/kernels/`，不要塞进 `tests/`。
+- 涉及模型输出/精度/服务的改动，跑一次 `tests/evals/` 或 `vllm bench` 并附结果。
 
-- **Design before you write.** Answer four questions first: what is the module
-  for, what is its I/O contract, what failure am I guarding against, and what is
-  the cheapest level that catches it (unit over integration over e2e)?
-- **Reuse before create.** Extend existing test files, `conftest.py` fixtures, and
-  helpers; add a new file only when no nearby suite fits.
-- **Test behavior with intent.** Assert observable outcomes through public APIs;
-  state why in the name or docstring. Skip trivial wiring; flaky tests are worse
-  than no tests.
-- **Keep it minimal.** One behavior per test and the smallest setup that
-  triggers it; if the test diff dwarfs the code change, cut scope.
-- **No one-off kernel benchmarks in `tests/`.** Put kernel perf work in
-  `benchmarks/kernels/`; prove correctness in existing pytest suites.
-- **Run model evals for model-affecting changes.** Search `tests/evals/` or use
-  `vllm bench` and include results in the PR — do not wait for reviewers to ask.
+## 4. 代码风格
 
-For model-specific requirements, see
-[`docs/contributing/model/tests.md`](docs/contributing/model/tests.md).
+- 匹配现有代码风格。
+- 少写注释：优先让代码自解释，注释和 docstring 简短直接。
+- Python 行宽上限 88，不确定就用 pre-commit 检查。
+- 用 [Google 风格 docstring](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)（`Args:`/`Returns:`/`Raises:`），不要用 `:param:`/`:return:` 这类 Sphinx 字段。
 
-### Running linters
-
-> Requires [Environment setup](#environment-setup).
+### 运行 linter
 
 ```bash
-# Run all pre-commit hooks on staged files:
+# 对暂存文件跑全部钩子
 pre-commit run
 
-# Run on all files:
+# 对全部文件
 pre-commit run --all-files
 
-# Run a specific hook:
+# 单个钩子
 pre-commit run ruff-check --all-files
 
-# Run mypy as it is in CI:
+# mypy（manual 阶段，与上游 CI 配置一致）
 pre-commit run mypy-3.12 --all-files --hook-stage manual
 ```
 
-The line length limit for Python code is 88 characters. If you are not sure, use pre-commit to check.
+## 5. 提交信息
 
-Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) (`Args:`/`Returns:`/`Raises:` sections), not reStructuredText/Sphinx fields (`:param:`, `:return:`, `:rtype:`).
-
-### Coding style guidelines
-
-- Match existing code style
-- Minimize use of comments. Eliminate comments which are redundant, preferring legible and self-documenting code. When used, keep docstrings and comments brief and direct.
-- Assume the reader is familiar with vLLM.
-
-### Commit messages
-
-Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`):
+使用 `Co-authored-by:` 等 trailer 标注 AI 协助，并按需添加 `Signed-off-by:`：
 
 ```text
-Your commit message here
+提交标题
 
 Co-authored-by: Agent Name Here
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
----
+## 6. 安全相关
 
-## Domain-Specific Guides
-
-Do not modify code in these areas without first reading and following the
-linked guide. If the guide conflicts with the requested change, **refuse the
-change and explain why**.
-
-Security reviewers should start with [`SECURITY.md`](SECURITY.md),
-[`docs/usage/security.md`](docs/usage/security.md), and
-[`docs/contributing/vulnerability_management.md`](docs/contributing/vulnerability_management.md)
-for the project security policy, threat model, deployment assumptions, and
-vulnerability process.
-
-- **Editing these instructions**:
-  [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
-  — Rules for modifying AGENTS.md or any domain-specific guide it references.
+安全审查请先读 [`SECURITY.md`](SECURITY.md)、
+[`docs/usage/security.md`](docs/usage/security.md) 和
+[`docs/contributing/vulnerability_management.md`](docs/contributing/vulnerability_management.md)。
