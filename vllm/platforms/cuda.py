@@ -142,6 +142,16 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
+        # [turing-sm75] SM75 (Turing) has no FlashAttention support: the vendored
+        # FA2 kernel is guarded by `__CUDA_ARCH__ >= 800`. Prefer FlashInfer
+        # (SM75 floor enabled in flashinfer.py) then Triton; never propose FA.
+        if device_capability.major < 8:
+            return [
+                AttentionBackendEnum.FLASHINFER,
+                AttentionBackendEnum.TRITON_ATTN,
+                AttentionBackendEnum.FLEX_ATTENTION,
+                AttentionBackendEnum.TURBOQUANT,
+            ]
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
         # cutlass path (used for dflash attention) is known to have problems.
         # So prefer FlashAttention when non-causal on SM100f.
