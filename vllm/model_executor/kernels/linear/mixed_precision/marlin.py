@@ -1,10 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""SM75 overlay: MarlinLinearKernel + firefly(int4→int8 prefill) 混合。
 
+在 0.29.0 上游实现上新增 firefly 分支（env 门控，off = 上游行为）：
+  - process_weights_after_loading: repack 前快照干净 scale/zp + 预计算 per-channel c_n
+  - apply_weights: 大 M(prefill) 现反量化为 int8 走 cutlass(IMMA)，
+    小 M(decode) 走上游 int4 Marlin
+
+门控与反量化细节见
+vllm/model_executor/layers/quantization/utils/firefly.py。
+"""
+
+import logging
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.utils.firefly import (
+    dequant_marlin_to_int8,
+    dequant_marlin_to_int8_cached,
+    firefly_active_int4,
+    int8_prefill_linear,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     MARLIN_SUPPORTED_GROUP_SIZES,
     apply_gptq_marlin_linear,
@@ -30,6 +48,119 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+logger = logging.getLogger(__name__)
+
+_firefly_int4_fallback_logged = False
+
+
+def _ff_int4_fallback_log() -> None:
+    # act-order int4 模型 firefly 回退上游 Marlin 时打一次明显日志(不刷屏):
+    # B1-hard repack 反推仅针对 has_perm=false, act-order(g_idx 排序)不支持。
+    global _firefly_int4_fallback_logged
+    if _firefly_int4_fallback_logged:
+        return
+    _firefly_int4_fallback_logged = True
+    logger.warning(
+        "[firefly-int4] 回退上游 Marlin: 模型为 act-order(g_idx 排序), "
+        "B1-hard 反推仅支持非 act-order, firefly prefill 对该模型禁用"
+    )
+
+
+# ---- firefly 混合 op(dynamo/inductor 兼容) ----
+# firefly 分支判据(`m > min_m`, m 是动态 shape) 若直接留在编译图里, inductor 会把
+# firefly 路径(含 custom op)一起编进 decode(M=1) 的图, 实测 decode 从 27 tok/s 掉到
+# 4.8 tok/s(baseline 无 firefly 时该分支被静态消除)。
+# 故把"门控 + firefly/Marlin 选择 + 执行"整体包成一个 torch.library custom op:
+# 图里只剩一个不透明 leaf, inductor 看不到分支, decode 图干净(=baseline 性能)。
+# op 内部按真实 M 求值: prefill(m>min_m)现反量化 int8 走 IMMA, decode 走上游 Marlin。
+@torch.library.custom_op("firefly::hybrid_linear", mutates_args=())
+def _ff_hybrid_linear(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s_marlin: torch.Tensor,
+    w_zp_marlin: torch.Tensor,
+    w_gidx: torch.Tensor,
+    g_idx_sort_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    bias: torch.Tensor,
+    w_s_clean: torch.Tensor,
+    w_zp_clean: torch.Tensor,
+    c_n: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    padded_k: int,
+    padded_n: int,
+    gs: int,
+    min_m: int,
+    has_zp: bool,
+    is_k_full: bool,
+    use_recip: bool,
+) -> torch.Tensor:
+    m = x.numel() // x.shape[-1]
+    if m > min_m:
+        # prefill: transient 反量化 int4→int8 + cutlass_scaled_mm(SM75 即 IMMA)
+        w_int8 = dequant_marlin_to_int8_cached(
+            w_q,
+            w_s_clean,
+            c_n,
+            gs,
+            size_k,
+            size_n,
+            padded_k,
+            padded_n,
+            w_zp=(w_zp_clean if w_zp_clean.numel() > 0 else None),
+            use_recip=use_recip,
+        )
+        return int8_prefill_linear(x, w_int8, c_n)
+    # decode: 上游 int4 Marlin
+    wtype = scalar_types.uint4 if has_zp else scalar_types.uint4b8
+    return apply_gptq_marlin_linear(
+        input=x,
+        weight=w_q,
+        weight_scale=w_s_marlin,
+        weight_zp=w_zp_marlin,
+        g_idx=w_gidx,
+        g_idx_sort_indices=g_idx_sort_indices,
+        workspace=workspace,
+        wtype=wtype,
+        input_size_per_partition=size_k,
+        output_size_per_partition=size_n,
+        is_k_full=is_k_full,
+        input_global_scale=(
+            input_global_scale if input_global_scale.numel() > 0 else None
+        ),
+        bias=bias if bias.numel() > 0 else None,
+        input_dtype=x.dtype,
+    )
+
+
+@_ff_hybrid_linear.register_fake
+def _(
+    x,
+    _w_q,
+    _w_s_marlin,
+    _w_zp_marlin,
+    _w_gidx,
+    _g_idx_sort_indices,
+    _workspace,
+    _input_global_scale,
+    _bias,
+    _w_s_clean,
+    _w_zp_clean,
+    _c_n,
+    _size_k,
+    size_n,
+    _padded_k,
+    _padded_n,
+    _gs,
+    _min_m,
+    _has_zp,
+    _is_k_full,
+    _use_recip,
+):
+    return torch.empty(x.shape[:-1] + (size_n,), dtype=x.dtype, device=x.device)
 
 
 class MarlinLinearKernel(MPLinearKernel):
@@ -83,6 +214,23 @@ class MarlinLinearKernel(MPLinearKernel):
         # Tile misalignment is fixed by zero-padding at weight prep.
         return True, None
 
+    # ---- firefly 门控(int4 权重 → int8 prefill) ----
+    def _firefly_enabled(self) -> bool:
+        # 仅对 int4 权重 + fp16/bf16 激活启用; int8/fp8 激活(W4A8/FP8)走上游,
+        # 不参与 firefly 反量化。
+        # gate 卡 scalar type 而非量化框架:
+        #   uint4b8 = 对称 int4(zp=8, compressed-tensors/GPTQ-sym)
+        #   uint4   = 非对称 int4(per-group qzeros, AWQ)
+        # 反量化统一 w_deq=(q-zp)*s, 对称 zp=8 是其特例(不回归)。
+        # 只有 hard 模式: 不常驻副本, prefill 现从 marlin 布局反。B1-hard 反推
+        # 仅针对 has_perm=false, act-order(g_idx 排序)不支持 → 禁用(回退上游)。
+        return (
+            firefly_active_int4()
+            and self.config.weight_type in (scalar_types.uint4b8, scalar_types.uint4)
+            and self.config.act_type in (torch.float16, torch.bfloat16)
+            and not self.config.has_g_idx
+        )
+
     # note assumes that
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale` is: {input_dim = 0, output_dim = 1}
@@ -111,6 +259,37 @@ class MarlinLinearKernel(MPLinearKernel):
             padded_n, padded_k = size_n, size_k
         else:
             padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
+
+        # firefly 回退: act-order int4 模型 B1-hard 不支持, firefly 禁用 → 上游 Marlin。
+        if (
+            firefly_active_int4()
+            and c.weight_type in (scalar_types.uint4b8, scalar_types.uint4)
+            and c.act_type in (torch.float16, torch.bfloat16)
+            and c.has_g_idx
+        ):
+            _ff_int4_fallback_log()
+
+        # hybrid: repack 前快照(此时 weight/scale 仍为干净布局, 未 permute/repack)。
+        # clone 防后续 in-place 修改。scale 统一转置成 N 在前 [N, K/gs]
+        # (compressed-tensors 已是 N 在前; AWQ 是 K 在前 [K/gs, N] 需转置)。
+        # 只有 hard 模式: 存干净 scale(小) + 维度; 非对称(AWQ)另存干净 qzeros
+        # (packed, 小, dequant 时解包); 不存 int4 副本, prefill 步现从 marlin 布局反回。
+        if self._firefly_enabled():
+            ws = getattr(layer, self.w_s_name).data.clone()
+            if ws.shape[0] != size_n:  # AWQ K 在前 → N 在前
+                ws = ws.t().contiguous()
+            layer._firefly_ws = ws  # [N, K/gs]
+            layer._firefly_gs = (
+                self.config.group_size if self.config.group_size > 0 else -1
+            )
+            layer._firefly_size_k = size_k
+            layer._firefly_size_n = size_n
+            layer._firefly_padded_k = padded_k
+            layer._firefly_padded_n = padded_n
+            # 非对称(AWQ): 快照干净 qzeros(packed [N/8, K/gs]); 对称: None(zp=8)。
+            layer._firefly_wzp = (
+                getattr(layer, self.w_zp_name).data.clone() if c.zero_points else None
+            )
 
         # Allocate marlin workspace, reusing existing storage on reload.
         self.workspace = marlin_make_workspace_new(
@@ -220,12 +399,64 @@ class MarlinLinearKernel(MPLinearKernel):
                 marlin_pad_dim(layer.bias, size_n, padded_n)
             )
 
+        # firefly c_n 缓存: load 时算一次 per-channel c_n(纯权重导出, M/chunk 无关),
+        # 运行时单遍反量化复用(免两遍 amax)。放在 repack(transform_w_q) 之后:
+        # 此时 w_q 已是 marlin 布局, 与 apply_weights 读取一致。
+        if self._firefly_enabled():
+            _, layer._firefly_c_n = dequant_marlin_to_int8(
+                getattr(layer, self.w_q_name).data,
+                layer._firefly_ws,
+                layer._firefly_gs,
+                layer._firefly_size_k,
+                layer._firefly_size_n,
+                layer._firefly_padded_k,
+                layer._firefly_padded_n,
+                w_zp=layer._firefly_wzp,
+            )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # hybrid: 大 M(prefill)把 int4 现反量化成 int8 走 cutlass(IMMA), 小 M(decode)
+        # 走上游 int4 Marlin。整个"门控+选择+执行"包在 _ff_hybrid_linear(op) 里,
+        # 对 inductor 不透明(图里一个 leaf), 避免 m>min_m 数据依赖分支拖慢 decode。
+        # input_global_scale/bias/w_zp_clean 用空张量表示 None(custom op 不收 None)。
+        if self._firefly_enabled():
+            c = self.config
+            w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
+            empty = torch.empty(0, device=x.device)
+            igs = getattr(layer, "input_global_scale", None)
+            igs_t = igs.data if igs is not None else empty
+            bias_t = bias.data if bias is not None else empty
+            wzp_c = getattr(layer, "_firefly_wzp", None)
+            wzp_c_t = wzp_c if wzp_c is not None else empty
+            return _ff_hybrid_linear(
+                x,
+                w_q,
+                w_s,
+                w_zp,
+                w_gidx,
+                layer.g_idx_sort_indices,
+                self.workspace,
+                igs_t,
+                bias_t,
+                layer._firefly_ws,
+                wzp_c_t,
+                layer._firefly_c_n,
+                c.partition_weight_shape[0],
+                c.partition_weight_shape[1],
+                layer._firefly_padded_k,
+                layer._firefly_padded_n,
+                layer._firefly_gs,
+                envs.VLLM_FIREFLY_MIN_M,
+                c.zero_points,
+                self.is_k_full,
+                envs.VLLM_FIREFLY_DEQUANT_MODEL == "fast",
+            )
+
         c = self.config
         w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
 

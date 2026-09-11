@@ -184,6 +184,10 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    # firefly(SM75): int4 权重 prefill 反量化为 int8 走 IMMA。见 firefly.py。
+    VLLM_FIREFLY: str = "0"
+    VLLM_FIREFLY_MIN_M: int = 1024
+    VLLM_FIREFLY_DEQUANT_MODEL: str = "def"
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -595,6 +599,17 @@ def _resolve_rust_cli_path() -> str | None:
             "Build with setuptools-rust or set the path explicitly."
         )
     return raw
+
+
+def _firefly_mode() -> str:
+    """VLLM_FIREFLY 归一化: '1'=开(=auto) / '0'=关。
+
+    未设默认 '0'(不激活); '1' 与 'auto' 等价(都算开); 其余值一律 '0'。
+    开 = int4(AWQ/GPTQ, W4A16) 走 int8 prefill 加速; fp8 走上游 marlin
+    (sm75 实测 firefly-fp8 不比 marlin 快)。
+    """
+    v = os.getenv("VLLM_FIREFLY", "").strip().lower()
+    return "1" if v in ("1", "auto", "on", "true", "yes") else "0"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -1501,6 +1516,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # firefly(SM75) prefill 加速总开关, 默认关(_firefly_mode 归一化):
+    #   未设 / 0 = 关(全走上游 marlin, 默认不激活)。
+    #   1 / auto = 开: int4(AWQ/GPTQ, W4A16) 大 M 现反量化成 int8, 走 CUTLASS(IMMA);
+    #     小 M/decode 保持 marlin。见 utils/firefly.py。
+    "VLLM_FIREFLY": _firefly_mode,
+    # crossover 阈值: M > VLLM_FIREFLY_MIN_M 才走 int8 prefill。
+    # 默认 1024: 参考项目在 T10 上实测 int8 反量化 ~1ms/层(M 无关地板),
+    # crossover M≈854; M>1024 int8 才稳定快于 marlin(1.13-1.33x)。
+    "VLLM_FIREFLY_MIN_M": lambda: int(os.environ.get("VLLM_FIREFLY_MIN_M", "1024")),
+    # int8 prefill 反量化步: "def"(默认) 除法(与两遍 pass2 逐 bit 一致);
+    # "fast" 乘倒数(per-row r=1/c_n, 再省 ~30% 反量化, off-by-one ≤0.06%)。
+    "VLLM_FIREFLY_DEQUANT_MODEL": lambda: os.environ.get(
+        "VLLM_FIREFLY_DEQUANT_MODEL", "def"
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
