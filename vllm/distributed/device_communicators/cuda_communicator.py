@@ -53,6 +53,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
             use_aiter_allreduce = False
+            use_firefly_ar = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
@@ -65,11 +66,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_aiter_allreduce = use_custom_allreduce and bool(
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
+            if current_platform.is_cuda():
+                from .firefly_allreduce import (
+                    firefly_ar_active,
+                    firefly_ar_world_ok,
+                )
+
+                use_firefly_ar = firefly_ar_active() and firefly_ar_world_ok(
+                    self.world_size
+                )
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.firefly_ar_comm = None  # FireflyAllReduce | None (lazy import)
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -109,6 +120,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.fi_ar_comm = FlashInferAllReduce(
                 group=self.cpu_group,
                 device=self.device,
+            )
+
+        if use_firefly_ar and current_platform.is_cuda():
+            # FireflyAllReduce: fp8 allreduce, 任意 2 的幂 world (2/4/8/...)。
+            # 2 卡走 P2P (NVLink IPC 显存直读)/SHM; N>=4 走 P2P butterfly。
+            # VLLM_FIREFLY_AR auto 跟随 VLLM_FIREFLY; 只 fp16 + >= MIN_SIZE。
+            # backend/disabled 在类内判定, 不适用时 disabled=True 自动回退 NCCL。
+            from .firefly_allreduce import FireflyAllReduce
+
+            shm_name = "firefly_ar_" + "_".join(str(r) for r in sorted(self.ranks))
+            self.firefly_ar_comm = FireflyAllReduce(
+                rank_in_group=self.rank_in_group,
+                world_size=self.world_size,
+                device=self.device,
+                shm_name=shm_name,
+                group=self.cpu_group,
             )
 
         if self.use_aiter_allreduce and self.world_size > 1:
@@ -231,6 +258,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         enabled_ar_backends: list[str] = []
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
+        if self.firefly_ar_comm is not None and not self.firefly_ar_comm.disabled:
+            enabled_ar_backends.append("FIREFLY_AR")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
         # VLLM_BATCH_INVARIANT off, NCCL symm mem enabled, world_size meets
         # min_world_size, and world_size either has a tuned entry in
@@ -328,6 +357,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
+            assert out is not None
+            return out
+        firefly_ar_comm = self.firefly_ar_comm
+        if (
+            firefly_ar_comm is not None
+            and not firefly_ar_comm.disabled
+            and firefly_ar_comm.should_firefly_ar(input_)
+        ):
+            out = firefly_ar_comm.all_reduce(input_)
             assert out is not None
             return out
         pynccl_comm = self.pynccl_comm
@@ -594,6 +632,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
+        if self.firefly_ar_comm is not None:
+            self.firefly_ar_comm.destroy()
+            self.firefly_ar_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]

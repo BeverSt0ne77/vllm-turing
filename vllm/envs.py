@@ -188,6 +188,10 @@ if TYPE_CHECKING:
     VLLM_FIREFLY: str = "0"
     VLLM_FIREFLY_MIN_M: int = 1024
     VLLM_FIREFLY_DEQUANT_MODEL: str = "def"
+    # firefly(SM75) fp8 all-reduce。见 firefly_allreduce.py。
+    VLLM_FIREFLY_AR: str = "auto"
+    VLLM_FIREFLY_AR_MIN_SIZE: int = 1048576
+    VLLM_FIREFLY_AR_BACKEND: str = "auto"
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -610,6 +614,38 @@ def _firefly_mode() -> str:
     """
     v = os.getenv("VLLM_FIREFLY", "").strip().lower()
     return "1" if v in ("1", "auto", "on", "true", "yes") else "0"
+
+
+def _firefly_ar_mode() -> str:
+    """VLLM_FIREFLY_AR 归一化: 'auto'(默认, 跟随 VLLM_FIREFLY) / '0'=强制关 /
+    'fp8'=强制开。
+
+    auto = firefly 开 (VLLM_FIREFLY=1) 时 fp8 allreduce 自动启用; firefly 关
+    → AR 关。'fp8' 单独开 (firefly 不用也开 AR); '0' 单独关。见
+    firefly_allreduce.py。
+    """
+    v = os.getenv("VLLM_FIREFLY_AR", "").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return "0"
+    if v in ("fp8", "1", "on", "true", "yes"):
+        return "fp8"
+    return "auto"
+
+
+def _firefly_ar_backend() -> str:
+    """VLLM_FIREFLY_AR_BACKEND 归一化: 'auto'(默认, 运行时按 _can_p2p 选 P2P
+    优先) / 'p2p'(强制 P2P) / 'shm'(强制 SHM)。
+
+    auto = 有 P2P (NVLink/PCIe 直连) 选 P2P (data/flag 全 device 显存, 无 host
+    bounce); 无 P2P 回 SHM。'p2p'/'shm' 强制指定 (P2P 初始化失败仍自动回 SHM
+    兜底)。
+    """
+    v = os.getenv("VLLM_FIREFLY_AR_BACKEND", "").strip().lower()
+    if v in ("p2p",):
+        return "p2p"
+    if v in ("shm", "host", "shared"):
+        return "shm"
+    return "auto"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -1531,6 +1567,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FIREFLY_DEQUANT_MODEL": lambda: os.environ.get(
         "VLLM_FIREFLY_DEQUANT_MODEL", "def"
     ),
+    # firefly(SM75) fp8 allreduce 总开关, 默认 auto 跟随 VLLM_FIREFLY:
+    #   auto = firefly 开→AR 开; 'fp8' 强制开; '0' 强制关。
+    # TP2 每层 2 次 AllReduce 量减半 (fp16->fp8)。见 firefly_allreduce.py。
+    "VLLM_FIREFLY_AR": _firefly_ar_mode,
+    # 只对大消息走 FireflyAllReduce, 小消息回退 NCCL。默认 1MB (fp16 字节):
+    # decode 小消息 (几百 KB) 时 amax 扫描 + flag spin 固定开销可能超过砍半
+    # 省下的传输; prefill 大块走 firefly。
+    "VLLM_FIREFLY_AR_MIN_SIZE": lambda: int(
+        os.environ.get("VLLM_FIREFLY_AR_MIN_SIZE", "1048576")
+    ),
+    # 传输 backend: auto(默认, 运行时 _can_p2p 选 P2P 优先) / p2p(强制) /
+    # shm(强制)。P2P 有 NVLink/PCIe 直连时 data/flag 全 device 显存, 无 host
+    # bounce; 无 P2P 回 SHM。
+    "VLLM_FIREFLY_AR_BACKEND": _firefly_ar_backend,
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
