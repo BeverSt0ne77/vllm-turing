@@ -1010,8 +1010,73 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             is_sm12x or not vllm_config.attention_config.use_non_causal
         ):
             return AttentionCGSupport.UNIFORM_BATCH
-        else:
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+        # SM75 small-query spec decode: with a single uniform decode shape
+        # (B1, query = num_spec + 1) matching the capture sizes exactly, the
+        # native fa2 prefill wrapper can be captured into a FULL graph (see
+        # _get_prefill_wrapper / build smallq branch). Automatic split-KV
+        # planning is retained; no attention arithmetic changes.
+        if cls._sm75_smallq_graph_supported(vllm_config, kv_cache_spec):
+            return AttentionCGSupport.UNIFORM_BATCH
+
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+    @staticmethod
+    def _sm75_captured_query_rows(
+        vllm_config: VllmConfig,
+    ) -> tuple[int, frozenset[int]]:
+        """(query_len, capture rows) for SM75 small-query FULL-graph capture.
+
+        Returns an empty row set when the configuration is not a single
+        uniform spec-decode query shape (B1, query = num_spec + 1, 1<=spec<=7)
+        matching one capture size.
+        """
+        sd = vllm_config.speculative_config
+        cc = vllm_config.compilation_config
+        query = (sd.num_speculative_tokens + 1) if sd else 1
+        if not sd or not 1 <= sd.num_speculative_tokens <= 7:
+            return query, frozenset()
+        max_capture = cc.max_cudagraph_capture_size
+        if not max_capture:
+            return query, frozenset()
+        rows = frozenset(
+            ((s + query - 1) // query) * query
+            for s in (cc.cudagraph_capture_sizes or [])
+            if s > 0
+            and ((s + query - 1) // query) * query <= max_capture
+            and ((s + query - 1) // query) <= 8
+        )
+        return query, rows
+
+    @classmethod
+    def _sm75_smallq_graph_supported(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> bool:
+        if not current_platform.is_device_capability(75):
+            return False
+        if vllm_config.model_config.dtype != torch.float16:
+            return False
+        if vllm_config.parallel_config.decode_context_parallel_size != 1:
+            return False
+        if envs.VLLM_BATCH_INVARIANT:
+            return False
+        query, capture_rows = cls._sm75_captured_query_rows(vllm_config)
+        if capture_rows != frozenset((query,)):
+            return False
+
+        kv_quant_compatible = True
+        for spec in iter_layer_specs(kv_cache_spec):
+            if not isinstance(spec, AttentionSpec):
+                continue
+            if spec.head_size not in (128, 256):
+                kv_quant_compatible = False
+                break
+            if spec.kv_quant_mode.is_nvfp4:
+                kv_quant_compatible = False
+                break
+        return kv_quant_compatible
 
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
@@ -1109,6 +1174,46 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self,
         causal: bool = True,
     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+        # SM75 small-query FULL-graph fast path: return a graph-capable fa2
+        # wrapper with preallocated indptr buffers for the captured
+        # (batch, query) shape (see build() smallq branch).
+        smallq_key = getattr(self, "_sm75_smallq_key", None)
+        if smallq_key is not None and causal:
+            key = (*smallq_key, True)
+            graph_prefills = getattr(self, "_sm75_graph_prefills", None)
+            if graph_prefills is None:
+                graph_prefills = {}
+                self._sm75_graph_prefills = graph_prefills
+            if key not in graph_prefills:
+                batch, query = smallq_key
+                pages = batch * cdiv(self.model_config.max_model_len, self.page_size)
+
+                def buf(n: int) -> torch.Tensor:
+                    return torch.empty(n, dtype=torch.int32, device=self.device)
+
+                graph_prefills[key] = BatchPrefillWithPagedKVCacheWrapper(
+                    self._get_workspace_buffer(),
+                    get_flashinfer_layout_string(self.kv_cache_layout),
+                    backend="fa2",
+                    use_cuda_graph=True,
+                    qo_indptr_buf=buf(batch + 1),
+                    paged_kv_indptr_buf=buf(batch + 1),
+                    paged_kv_indices_buf=buf(pages),
+                    paged_kv_last_page_len_buf=buf(batch),
+                )
+                logger.info(
+                    "SM75 FA2 small-query graph buffers: B=%d q=%d heads=%d/%d "
+                    "D=%d page=%d causal=%s",
+                    batch,
+                    query,
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.page_size,
+                    causal,
+                )
+            return graph_prefills[key]
+
         if not causal:
             if self.use_dcp:
                 raise NotImplementedError(
@@ -1280,6 +1385,51 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return paged_kv_indices
 
     def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> FlashInferMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+
+        # SM75 small-query FULL-graph fast path: for the B1 uniform spec
+        # decode shape matching the single captured query size, mark the key
+        # so _get_prefill_wrapper returns the graph-capable fa2 wrapper.
+        # Other batches keep the original dynamic wrapper instead of
+        # allocating per-shape graph workspaces that never replay.
+        self._sm75_smallq_key = None
+        if (
+            current_platform.is_device_capability(75)
+            and not self.use_dcp
+            and not self.has_sinks
+            and not self.is_kvcache_nvfp4
+            and self.q_data_type_prefill == torch.float16
+            and self.kv_cache_dtype in (torch.float16, torch.float8_e4m3fn)
+            and self.head_dim in (128, 256)
+            and self.enable_cuda_graph
+            and 2 <= common_attn_metadata.max_query_len <= 8
+            and common_attn_metadata.num_reqs == 1
+            and common_attn_metadata.num_actual_tokens
+            == common_attn_metadata.max_query_len
+            and common_prefix_len == 0
+            and self.prefill_fixed_split_size in (-1, None)
+            and not self.disable_split_kv
+        ):
+            capture_query, capture_rows = self._sm75_captured_query_rows(
+                self.vllm_config
+            )
+            if (
+                capture_rows == frozenset((capture_query,))
+                and common_attn_metadata.max_query_len == capture_query
+            ):
+                self._sm75_smallq_key = (num_reqs, common_attn_metadata.max_query_len)
+
+        try:
+            return self._build(common_prefix_len, common_attn_metadata, fast_build)
+        finally:
+            self._sm75_smallq_key = None
+
+    def _build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,

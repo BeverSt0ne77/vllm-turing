@@ -8,6 +8,8 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -22,6 +24,8 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+logger = init_logger(__name__)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -77,6 +81,146 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+
+
+@triton.jit
+def _sm75_b1_stage_kernel(
+    TABLE,
+    SEQ,
+    QUERY,
+    ACCEPTED,
+    STATE,
+    MASK,
+    TOKENS,
+    QLOC,
+    OUT_ACCEPTED,
+    Q: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ALIGN: tl.constexpr,
+):
+    """Stage B1 uniform spec-decode GDN metadata in one launch.
+
+    Copies the q state-slot indices from the block table (starting at the
+    last occupied block in align mode), the identity token indices, the
+    query start loc, and the accepted count into the builder's persistent
+    full-cudagraph buffers.
+    """
+    i = tl.arange(0, 32)
+    start = tl.full((), 0, tl.int32)
+    if ALIGN:
+        length = tl.load(SEQ)
+        start = tl.maximum((length - 1) // BLOCK_SIZE, 0)
+    state = tl.load(TABLE + start + i, i < Q, 0)
+    tl.store(STATE + i, state, i < Q)
+    tl.store(TOKENS + i, i, i < Q)
+    query = tl.load(QUERY + i, i < 2, 0)
+    tl.store(QLOC + i, query, i < 2)
+    accepted = tl.load(ACCEPTED)
+    tl.store(OUT_ACCEPTED + i, accepted, i == 0)
+    tl.store(MASK + i, True, i == 0)
+
+
+def _sm75_b1_metadata_eligible(
+    builder,
+    m: CommonAttentionMetadata,
+    num_accepted_tokens: torch.Tensor | None,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+    common_prefix_len: int,
+) -> bool:
+    """Preconditions for the B1 fast path; read-only checks, no syncs beyond
+    the draft-token count scalar that the caller already materialized."""
+    q = builder.num_spec + 1
+    if not (
+        common_prefix_len == 0
+        and builder.use_full_cuda_graph
+        and 1 <= builder.num_spec <= 7
+        and m.num_reqs == 1
+        and m.num_actual_tokens == q
+        and m.max_query_len == q
+        and builder.decode_cudagraph_max_bs >= q
+        and num_accepted_tokens is not None
+        and num_accepted_tokens.is_cuda
+        and num_accepted_tokens.numel() == 1
+        and num_decode_draft_tokens_cpu is not None
+        and num_decode_draft_tokens_cpu.device.type == "cpu"
+        and num_decode_draft_tokens_cpu.numel() == 1
+        and m.query_start_loc_cpu.device.type == "cpu"
+        and m.query_start_loc_cpu.numel() == 2
+        and m.block_table_tensor.is_cuda
+        and m.block_table_tensor.ndim == 2
+        and m.block_table_tensor.shape[0] == 1
+        and m.block_table_tensor.stride(1) == 1
+        and m.block_table_tensor.shape[1] >= q
+        and m.seq_lens.is_cuda
+        and m.seq_lens.numel() == 1
+        and m.query_start_loc.is_cuda
+        and m.query_start_loc.numel() == 2
+        and m.query_start_loc.stride(0) == 1
+        and num_accepted_tokens.device
+        == m.seq_lens.device
+        == m.query_start_loc.device
+        == m.block_table_tensor.device
+        == builder.spec_state_indices_tensor.device
+    ):
+        return False
+    mode = builder.vllm_config.cache_config.mamba_cache_mode
+    if mode not in ("all", "none", "align"):
+        return False
+    if mode == "align":
+        if builder.kv_cache_spec.num_speculative_blocks < builder.num_spec:
+            return False
+        if (
+            max((m.max_seq_len - 1) // builder.kv_cache_spec.block_size, 0) + q
+            > m.block_table_tensor.shape[1]
+        ):
+            return False
+    return (
+        num_decode_draft_tokens_cpu.item() == builder.num_spec
+        and m.query_start_loc_cpu[0].item() == 0
+        and m.query_start_loc_cpu[1].item() == q
+    )
+
+
+def _sm75_b1_metadata_build_fast(
+    builder,
+    m: CommonAttentionMetadata,
+    num_accepted_tokens: torch.Tensor,
+) -> GDNAttentionMetadata:
+    q = builder.num_spec + 1
+    mode = builder.vllm_config.cache_config.mamba_cache_mode
+    # The block table for the mamba cache modes differs: align gathers the
+    # tail blocks per request, all/none pass the table through. Stage from
+    # the raw table with the align offset; all/none start at block 0.
+    _sm75_b1_stage_kernel[(1,)](
+        m.block_table_tensor,
+        m.seq_lens,
+        m.query_start_loc,
+        num_accepted_tokens,
+        builder.spec_state_indices_tensor,
+        builder.spec_sequence_masks,
+        builder.spec_token_indx,
+        builder.spec_query_start_loc,
+        builder.num_accepted_tokens,
+        q,
+        builder.kv_cache_spec.block_size,
+        mode == "align",
+        num_warps=1,
+    )
+    return GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=1,
+        num_spec_decode_tokens=q,
+        num_actual_tokens=q,
+        spec_query_start_loc=builder.spec_query_start_loc[:2],
+        spec_state_indices_tensor=builder.spec_state_indices_tensor[:1],
+        spec_sequence_masks=builder.spec_sequence_masks[:1],
+        spec_token_indx=builder.spec_token_indx[:q],
+        non_spec_token_indx=builder.non_spec_token_indx[:0],
+        num_accepted_tokens=builder.num_accepted_tokens[:1],
+    )
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -218,6 +362,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+
+        # SM75 B1 uniform spec-decode fast path: stage all metadata with a
+        # single 1-warp Triton kernel and zero CPU-GPU syncs, preserving the
+        # native fallback for mixed/prefill/batch shapes.
+        if (
+            self.num_spec in (5, 6, 7)
+            and self.vllm_config.parallel_config.decode_context_parallel_size == 1
+            and _sm75_b1_metadata_eligible(
+                self,
+                m,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+                common_prefix_len,
+            )
+        ):
+            return _sm75_b1_metadata_build_fast(self, m, num_accepted_tokens)
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
