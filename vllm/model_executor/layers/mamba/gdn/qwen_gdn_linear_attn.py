@@ -90,9 +90,39 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+def _flashqla_sm75_prefill_unsupported_reason(
+    vllm_config: VllmConfig,
+) -> str | None:
+    """Return why FlashQLA-SM75 prefill cannot run, or None if it can.
+
+    The vendored FlashQLA-SM75 kernel is compiled for sm_75 only and
+    supports fp16 tensors with 128-wide key/value heads.
+    """
+    if not current_platform.is_cuda():
+        return "the platform is not CUDA"
+    if not current_platform.is_device_capability(75):
+        return "the device compute capability is not 7.5"
+
+    text_config = vllm_config.model_config.hf_text_config
+    head_k_dim = getattr(text_config, "linear_key_head_dim", None)
+    head_v_dim = getattr(text_config, "linear_value_head_dim", None)
+    if head_k_dim != 128 or head_v_dim != 128:
+        return f"the GDN head dimensions are K={head_k_dim}, V={head_v_dim}"
+    if vllm_config.model_config.dtype != torch.float16:
+        return f"the model activation dtype is {vllm_config.model_config.dtype}"
+
+    try:
+        from vllm.third_party.flash_qla_sm75 import (  # noqa: F401
+            chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
+        )
+    except ImportError as exc:
+        return f"the vendored FlashQLA package cannot be imported: {exc}"
+    return None
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "flashqla_sm75"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -123,6 +153,7 @@ def _resolve_gdn_prefill_backend(
 
     supports_flashinfer = False
     supports_cutedsl = False
+    supports_flashqla_sm75 = False
 
     if current_platform.is_device_capability(90):
         supports_flashinfer = True
@@ -133,11 +164,21 @@ def _resolve_gdn_prefill_backend(
     ):
         supports_flashinfer = True
         supports_cutedsl = True
+    elif current_platform.is_device_capability(75):
+        # Vendored FlashQLA-SM75 is opt-in only. It is selected when
+        # ``flashqla_sm75`` is requested on exact SM75 with FP16 model
+        # weights and 128-wide key/value heads. Unsupported requests
+        # fall back to Triton.
+        supports_flashqla_sm75 = (
+            _flashqla_sm75_prefill_unsupported_reason(vllm_config) is None
+        )
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"
     if backend == "cutedsl" and supports_cutedsl:
         return backend, "cutedsl"
+    if backend == "flashqla_sm75" and supports_flashqla_sm75:
+        return backend, "flashqla_sm75"
     return backend, "triton"
 
 
@@ -163,6 +204,7 @@ def _log_gdn_backend_decision(
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
+        "flashqla_sm75": "FlashQLA-SM75",
     }[active_backend]
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
@@ -228,6 +270,51 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def flashqla_sm75_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    core_attn_out: torch.Tensor | None = None,
+):
+    from vllm.third_party.flash_qla_sm75 import (
+        chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
+    )
+
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, q.shape[1]], device=q.device, dtype=torch.int32)
+    elif cu_seqlens.dtype != torch.int32:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+
+    output = None
+    if core_attn_out is not None:
+        candidate = core_attn_out[: q.shape[1]].unsqueeze(0)
+        if candidate.shape == v.shape and candidate.is_contiguous():
+            output = candidate
+
+    return chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        g=g.contiguous(),
+        beta=beta.contiguous(),
+        cu_seqlens=cu_seqlens.contiguous(),
+        initial_state=initial_state.contiguous(),
+        scale=q.shape[-1] ** -0.5,
+        output_final_state=output_final_state,
+        validate_cu_seqlens=False,
+        output=output,
+    )
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -236,11 +323,19 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if backend in ("flashinfer", "cutedsl", "flashqla_sm75") and (
+            active_backend != backend
+        ):
+            reason = (
+                _flashqla_sm75_prefill_unsupported_reason(vllm_config)
+                if backend == "flashqla_sm75"
+                else "the current platform does not satisfy its requirements"
+            )
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
-                "kernel on the current platform. Falling back to Triton/FLA.",
+                "kernel because %s. Falling back to Triton/FLA.",
                 backend,
+                reason,
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
@@ -248,6 +343,8 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "flashqla_sm75":
+            self._forward_method = self.forward_flashqla_sm75
         else:
             self._forward_method = self.forward_native
 
@@ -355,6 +452,62 @@ class ChunkGatedDeltaRule(CustomOp):
         if not output_final_state:
             final_state = None
         return o, final_state
+
+    def forward_flashqla_sm75(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else None
+        unsupported = (
+            capability != (7, 5)
+            or q.dtype != torch.float16
+            or k.dtype != torch.float16
+            or v.dtype != torch.float16
+            or q.shape[-1] != 128
+            or v.shape[-1] != 128
+        )
+        if unsupported:
+            logger.warning_once(
+                "FlashQLA-SM75 received unsupported runtime tensors; falling "
+                "back to Triton/FLA for this prefill call."
+            )
+            return self.forward_native(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                core_attn_out=core_attn_out,
+            )
+        return flashqla_sm75_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
+        )
 
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
@@ -1160,6 +1313,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
         except Exception:
+            if self.gdn_prefill_backend == "flashqla_sm75":
+                raise
             logger.warning(
                 "GDN prefill kernel warmup (T=%d) failed for "
                 "layer %s. First inference may OOM due to "
